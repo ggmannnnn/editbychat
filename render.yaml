@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: editbychat-alpha
+    runtime: docker
+    healthCheckPath: /healthz
+    envVars:
+      - key: PROJECTS_DIR
+        value: /app/projects
+      - key: MAX_UPLOAD_MB
+        value: 500
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-6-luna
+      - key: OPENAI_CAPTION_MODEL
+        value: whisper-1
+    disk:
+      name: projects
+      mountPath: /app/projects
+      sizeGB: 10
