@@ -121,6 +121,62 @@ def run(cmd: list[str]) -> None:
         raise RuntimeError(p.stderr[-5000:])
 
 
+
+
+def _friendly_media_error(value: object) -> str:
+    text = str(value or "")
+    low = text.lower()
+    if "no space left on device" in low or "disk quota exceeded" in low:
+        return "Storage is full. Old temporary renders were cleaned up; please try the edit again."
+    if "conversion failed" in low:
+        return "The video render failed. Please try again; if it repeats, use a shorter/smaller video or remove the last layer."
+    if "invalid data found" in low or "moov atom not found" in low:
+        return "This media file could not be read. Try exporting it as a standard MP4 (H.264/AAC) and upload it again."
+    if "permission denied" in low:
+        return "The server could not write the rendered video. Please try again."
+    return "The video render failed. Please try the edit again."
+
+
+def cleanup_project_storage(project_dir: Path, meta: dict | None = None, keep_exports: int = 1) -> int:
+    """Remove obsolete previews/failed temp renders while preserving source, current preview, assets and caches."""
+    try:
+        if meta is None:
+            mp = project_dir / "project.json"
+            if not mp.exists():
+                return 0
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+        keep = {"project.json", str(meta.get("base_render", "")), str(meta.get("current", ""))}
+        for a in meta.get("assets", []):
+            if a.get("stored"):
+                keep.add(str(a["stored"]))
+        exports = sorted(project_dir.glob("export_*.mp4"), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+        keep.update(x.name for x in exports[:max(0, keep_exports)])
+        removed = 0
+        for f in project_dir.iterdir():
+            if not f.is_file() or f.name in keep:
+                continue
+            if (f.name.startswith(("edit_", "layer_tmp_", "splice_", "export_", "original"))
+                    and f.suffix.lower() in {".mp4", ".mov", ".m4v", ".webm", ".mkv"}):
+                try:
+                    removed += f.stat().st_size
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return removed
+    except Exception:
+        return 0
+
+
+def cleanup_all_projects() -> int:
+    total = 0
+    try:
+        for d in PROJECTS.iterdir():
+            if d.is_dir():
+                total += cleanup_project_storage(d)
+    except Exception:
+        pass
+    return total
+
 def probe_duration(path: Path) -> float:
     p = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
@@ -464,10 +520,13 @@ def render_layer_stack(project_dir: Path, meta: dict, dst: Path) -> None:
 
 
 def rerender_layers(project_dir: Path, meta: dict) -> Path:
+    # Free stale previews before a new render; important on small persistent volumes.
+    cleanup_project_storage(project_dir, meta)
     dst = next_output(project_dir, meta)
     render_layer_stack(project_dir, meta, dst)
     meta["current"] = dst.name
     meta.setdefault("history", []).append(dst.name)
+    cleanup_project_storage(project_dir, meta)
     return dst
 
 def parse_number(text: str) -> Optional[float]:
@@ -1680,6 +1739,7 @@ def export_project_file(project_dir: Path, meta: dict, req: ExportRequest) -> Pa
     fps = req.fps if req.fps in {"source", "30", "60"} else "source"
     quality = req.quality if req.quality in {"draft", "balanced", "high"} else "balanced"
     src = current_path(project_dir, meta)
+    cleanup_project_storage(project_dir, meta, keep_exports=0)
     dims = _export_dimensions(src, resolution)
     qmap = {"draft": (28, "veryfast"), "balanced": (23, "medium"), "high": (18, "slow")}
     crf, preset = qmap[quality]
@@ -1805,6 +1865,11 @@ def status():
     }
 
 
+@app.on_event("startup")
+def _startup_storage_cleanup() -> None:
+    cleanup_all_projects()
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "version": "1.0-alpha-gemini"}
@@ -1837,6 +1902,9 @@ async def upload_video(file: UploadFile = File(...)):
     except RuntimeError as e:
         shutil.rmtree(project_dir, ignore_errors=True)
         raise HTTPException(400, f"Could not read this video: {str(e)[-500:]}")
+
+    # The normalized H.264/AAC file becomes the project source; the raw upload is no longer needed.
+    original.unlink(missing_ok=True)
 
     now = utc_now()
     project_name = Path(file.filename).stem[:80] or "Untitled video"
@@ -2100,10 +2168,10 @@ def _run_edit_job(job_id: str, req: EditRequest) -> None:
             JOBS[job_id].update({"status": "done", "progress": 100, "stage": "Done", "result": result, "updated_at": utc_now()})
     except HTTPException as exc:
         with JOB_LOCK:
-            JOBS[job_id].update({"status": "error", "progress": 100, "stage": "Error", "error": str(exc.detail), "updated_at": utc_now()})
+            JOBS[job_id].update({"status": "error", "progress": 100, "stage": "Error", "error": _friendly_media_error(exc.detail) if "ffmpeg" in str(exc.detail).lower() or "conversion failed" in str(exc.detail).lower() else str(exc.detail), "updated_at": utc_now()})
     except Exception as exc:
         with JOB_LOCK:
-            JOBS[job_id].update({"status": "error", "progress": 100, "stage": "Error", "error": str(exc)[-1800:], "updated_at": utc_now()})
+            JOBS[job_id].update({"status": "error", "progress": 100, "stage": "Error", "error": _friendly_media_error(exc), "updated_at": utc_now()})
     finally:
         JOB_CONTEXT.job_id = None
 
