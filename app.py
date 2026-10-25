@@ -26,12 +26,10 @@ PROJECTS.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_MB = max(10, int(os.getenv("MAX_UPLOAD_MB", "500")))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-# Temporary timestamp-capable caption model. OpenAI documents that word timestamps
-# currently use whisper-1; it is scheduled for shutdown on 2027-02-26.
-OPENAI_CAPTION_MODEL = os.getenv("OPENAI_CAPTION_MODEL", "whisper-1").strip() or "whisper-1"
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+GEMINI_TRANSCRIBE_MODEL = os.getenv("GEMINI_TRANSCRIBE_MODEL", "gemini-3.5-transcribe").strip() or "gemini-3.5-transcribe"
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
 
 FONT_CANDIDATES = [
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
@@ -329,8 +327,8 @@ def _context_revision_for_layer(command: str, meta: dict, layer: dict, duration:
     rev = parse_context_revision(command, pseudo, duration)
     if rev and rev.get("edits"):
         return rev["edits"][-1]
-    if OPENAI_API_KEY:
-        rev = parse_context_with_openai(command, pseudo, duration)
+    if GEMINI_API_KEY:
+        rev = parse_context_with_gemini(command, pseudo, duration)
         if rev and rev.get("edits"):
             return rev["edits"][-1]
     return None
@@ -375,8 +373,8 @@ def parse_layer_reference_command(command: str, meta: dict, duration: float) -> 
     return None
 
 
-def parse_layer_reference_with_openai(command: str, meta: dict, duration: float) -> Optional[dict]:
-    if not OPENAI_API_KEY or not meta.get("layers"):
+def parse_layer_reference_with_gemini(command: str, meta: dict, duration: float) -> Optional[dict]:
+    if not GEMINI_API_KEY or not meta.get("layers"):
         return None
     layers = [_public_layer(x) for x in meta.get("layers", [])]
     instructions = f"""You resolve references to existing layers in a chat-first video editor.
@@ -389,13 +387,8 @@ Return JSON only. If the user refers to an EXISTING layer, return one of:
 {{"action":"update","layer_id":"...","edit":{{complete revised edit object}},"summary":"..."}}
 If the user is asking for a NEW edit rather than referring to an existing layer, return {{"action":"none"}}.
 Never change edit type. Preserve fields the user did not ask to change. Reply summary in the user's language."""
-    payload = {"model": OPENAI_MODEL, "instructions": instructions, "input": command, "max_output_tokens": 500}
     try:
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(f"{OPENAI_BASE_URL}/responses", headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, json=payload)
-            r.raise_for_status(); text = _extract_response_text(r.json()).strip()
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
-        obj = json.loads(text)
+        obj = gemini_json(instructions, command, 600)
         if obj.get("action") not in {"disable", "enable", "update"}:
             return None
         layer = _layer_by_id(meta, obj.get("layer_id"))
@@ -411,7 +404,7 @@ Never change edit type. Preserve fields the user did not ask to change. Reply su
             obj["edit"] = normalized[0]
         return obj
     except Exception as exc:
-        print("Layer AI resolver failed:", repr(exc))
+        print("Layer Gemini resolver failed:", repr(exc))
         return None
 
 
@@ -671,8 +664,8 @@ def parse_context_revision(command: str, meta: dict, base_duration: float) -> Op
     }
 
 
-def parse_context_with_openai(command: str, meta: dict, base_duration: float) -> Optional[dict]:
-    if not OPENAI_API_KEY:
+def parse_context_with_gemini(command: str, meta: dict, base_duration: float) -> Optional[dict]:
+    if not GEMINI_API_KEY:
         return None
     idx, last = _last_command(meta)
     if last is None or not last.get("edits"):
@@ -686,21 +679,14 @@ def parse_context_with_openai(command: str, meta: dict, base_duration: float) ->
         "If it is a new independent edit, return {\"edits\":[],\"summary\":\"not a revision\"}. "
         "Use only the same supported edit schemas as the previous plan. Preserve fields the user did not ask to change. Return the summary in the same language as the user's new message. Do not invent edits."
     )
-    payload = {"model": OPENAI_MODEL, "instructions": instructions, "input": command, "max_output_tokens": 500}
     try:
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(f"{OPENAI_BASE_URL}/responses", headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, json=payload)
-            r.raise_for_status()
-            text = _extract_response_text(r.json()).strip()
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
-        plan = normalize_ai_plan(json.loads(text), base_duration)
+        plan = normalize_ai_plan(gemini_json(instructions, command, 600), base_duration)
         if not plan["edits"]:
             return None
-        return {**plan, "revision_of": idx, "base": last.get("base"), "parser": "context-ai"}
+        return {**plan, "revision_of": idx, "base": last.get("base"), "parser": "context-gemini"}
     except Exception as exc:
-        print("Context AI parser failed:", repr(exc))
+        print("Context Gemini parser failed:", repr(exc))
         return None
-
 
 def parse_single_deterministic(command: str, duration: float) -> Optional[dict]:
     raw = command.strip()
@@ -929,6 +915,38 @@ def _extract_response_text(data: dict) -> str:
     return ""
 
 
+def _extract_gemini_text(data: dict) -> str:
+    try:
+        parts = data.get("candidates", [])[0].get("content", {}).get("parts", [])
+        return "".join(str(p.get("text", "")) for p in parts if p.get("text"))
+    except Exception:
+        return ""
+
+
+def gemini_json(instructions: str, user_text: str, max_output_tokens: int = 700) -> dict:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Gemini is not configured")
+    payload = {
+        "system_instruction": {"parts": [{"text": instructions}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": max_output_tokens,
+            "responseMimeType": "application/json",
+        },
+    }
+    url = f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}:generateContent"
+    with httpx.Client(timeout=45.0) as client:
+        r = client.post(url, headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}, json=payload)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Gemini request failed ({r.status_code}): {r.text[-1200:]}")
+        text = _extract_gemini_text(r.json()).strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+    if not text:
+        raise RuntimeError("Gemini returned an empty response")
+    return json.loads(text)
+
+
 def normalize_ai_plan(plan: Any, duration: float) -> dict:
     if not isinstance(plan, dict) or not isinstance(plan.get("edits"), list):
         raise ValueError("AI returned an invalid edit plan")
@@ -1006,52 +1024,36 @@ def normalize_ai_plan(plan: Any, duration: float) -> dict:
     return {"edits": clean, "summary": " ".join(_summary_for(e) for e in clean)}
 
 
-def parse_with_openai(command: str, duration: float) -> dict:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("AI is not configured")
+def parse_with_gemini(command: str, duration: float) -> dict:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Gemini is not configured")
 
     instructions = f"""You are the command parser for a video editor. Convert the user's editing request into JSON only.
 Current video duration is {duration:.2f} seconds.
 Supported edit types ONLY:
-- trim_start: {{\"type\":\"trim_start\",\"seconds\":number}}
-- remove_segment: {{\"type\":\"remove_segment\",\"start\":number,\"end\":number}}
-- aspect: {{\"type\":\"aspect\",\"ratio\":\"9:16\"|\"1:1\"|\"16:9\"}}
-- volume: {{\"type\":\"volume\",\"factor\":number}} where 1 is 100%, 0 mute
-- speed: {{\"type\":\"speed\",\"speed\":number}} from 0.25 to 4
-- text_overlay: {{\"type\":\"text_overlay\",\"text\":string,\"start\":number,\"end\":number,\"position\":\"top\"|\"center\"|\"bottom\"}}
-- captions: {{\"type\":\"captions\",\"position\":\"top\"|\"center\"|\"bottom\"}} for automatic speech captions
-- zoom_segment: {{\"type\":\"zoom_segment\",\"start\":number,\"end\":number,\"zoom\":1.05..2.0,\"focus\":\"center\"|\"left\"|\"right\"|\"top\"|\"bottom\"}}
-- fade: {{\"type\":\"fade\",\"direction\":\"in\"|\"out\",\"duration\":number}}
-- insert_clip: {{\"type\":\"insert_clip\",\"at\":number,\"transition\":\"cut\"|\"fade\"}} using the latest attached video clip
-- replace_segment: {{\"type\":\"replace_segment\",\"start\":number,\"end\":number,\"transition\":\"cut\"|\"fade\"}} using the latest attached video clip
-Return exactly: {{\"edits\":[...],\"summary\":\"short human summary\"}}.
+- trim_start: {{"type":"trim_start","seconds":number}}
+- remove_segment: {{"type":"remove_segment","start":number,"end":number}}
+- aspect: {{"type":"aspect","ratio":"9:16"|"1:1"|"16:9"}}
+- volume: {{"type":"volume","factor":number}} where 1 is 100%, 0 mute
+- speed: {{"type":"speed","speed":number}} from 0.25 to 4
+- text_overlay: {{"type":"text_overlay","text":string,"start":number,"end":number,"position":"top"|"center"|"bottom"}}
+- captions: {{"type":"captions","position":"top"|"center"|"bottom"}} for automatic speech captions
+- zoom_segment: {{"type":"zoom_segment","start":number,"end":number,"zoom":1.05..2.0,"focus":"center"|"left"|"right"|"top"|"bottom"}}
+- fade: {{"type":"fade","direction":"in"|"out","duration":number}}
+- insert_clip: {{"type":"insert_clip","at":number,"transition":"cut"|"fade"}} using the latest attached video clip
+- replace_segment: {{"type":"replace_segment","start":number,"end":number,"transition":"cut"|"fade"}} using the latest attached video clip
+Return exactly: {{"edits":[...],"summary":"short human summary"}}.
 Understand the user's language directly. Strongly support English, Spanish, Portuguese, French, Arabic and Moroccan Darija (Arabic or Latin script), German, Hindi, Indonesian, Turkish, Japanese, Korean, Chinese, Italian, and Russian. Return the summary in the same language as the user's command. Never invent an edit the user did not ask for. If the request is unsupported, return an empty edits array. For 'at the end for N seconds', calculate start = duration-N and end = duration. For multi-step requests, return edits in the requested order."""
-    payload = {
-        "model": OPENAI_MODEL,
-        "instructions": instructions,
-        "input": command,
-        "max_output_tokens": 500,
-    }
-    with httpx.Client(timeout=30.0) as client:
-        r = client.post(
-            f"{OPENAI_BASE_URL}/responses",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        r.raise_for_status()
-        text = _extract_response_text(r.json()).strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
-    return normalize_ai_plan(json.loads(text), duration)
-
+    return normalize_ai_plan(gemini_json(instructions, command, 800), duration)
 
 def parse_command(command: str, duration: float) -> tuple[dict, str]:
     # Deterministic parser is first: cheap, fast and predictable for common commands.
     local = parse_deterministic(command, duration)
     if local["edits"]:
         return local, "local"
-    if OPENAI_API_KEY:
+    if GEMINI_API_KEY:
         try:
-            plan = parse_with_openai(command, duration)
+            plan = parse_with_gemini(command, duration)
             if plan["edits"]:
                 return plan, "ai"
         except Exception as exc:
@@ -1157,19 +1159,79 @@ def segments_to_caption_cues(segments: list[dict]) -> list[dict]:
 def _caption_cache_path(work_dir: Path, audio_hash: str) -> Path:
     cache_dir = work_dir / "caption_cache"
     cache_dir.mkdir(exist_ok=True)
-    model_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", OPENAI_CAPTION_MODEL)[:60]
+    model_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", GEMINI_TRANSCRIBE_MODEL)[:60]
     return cache_dir / f"{model_key}_{audio_hash}.json"
 
 
+def _offset_seconds(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if text.endswith("s"):
+        text = text[:-1]
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def _upload_gemini_file(path: Path, mime_type: str) -> tuple[str, str | None]:
+    size = path.stat().st_size
+    start_url = f"{GEMINI_BASE_URL.replace('/v1beta','')}/upload/v1beta/files"
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(size),
+        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "Content-Type": "application/json",
+    }
+    with httpx.Client(timeout=120.0) as client:
+        r = client.post(start_url, headers=headers, json={"file": {"display_name": path.name}})
+        if r.status_code >= 400:
+            raise RuntimeError(f"Gemini file upload start failed ({r.status_code}): {r.text[-1200:]}")
+        upload_url = r.headers.get("x-goog-upload-url")
+        if not upload_url:
+            raise RuntimeError("Gemini did not return a resumable upload URL")
+        with path.open("rb") as fh:
+            r2 = client.post(
+                upload_url,
+                headers={
+                    "Content-Length": str(size),
+                    "X-Goog-Upload-Offset": "0",
+                    "X-Goog-Upload-Command": "upload, finalize",
+                    "Content-Type": mime_type,
+                },
+                content=fh.read(),
+            )
+        if r2.status_code >= 400:
+            raise RuntimeError(f"Gemini file upload failed ({r2.status_code}): {r2.text[-1200:]}")
+        info = r2.json().get("file", {})
+        uri = info.get("uri")
+        if not uri:
+            raise RuntimeError("Gemini upload response did not contain a file URI")
+        return str(uri), info.get("name")
+
+
+def _delete_gemini_file(name: str | None) -> None:
+    if not name:
+        return
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            client.delete(f"{GEMINI_BASE_URL}/{name}", headers={"x-goog-api-key": GEMINI_API_KEY})
+    except Exception:
+        pass
+
+
 def transcribe_caption_cues(src: Path, work_dir: Path) -> tuple[list[dict], str]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Auto captions require OPENAI_API_KEY")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Auto captions require GEMINI_API_KEY")
     if not probe_has_audio(src):
         raise RuntimeError("This video has no audio track to caption")
 
     audio = work_dir / f"caption_audio_{uuid.uuid4().hex[:8]}.mp3"
-    # Normalize audio before hashing. This means visual-only project changes reuse
-    # the same transcription while audio-changing edits correctly miss the cache.
     run(["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(audio)])
     audio_hash = hashlib.sha256(audio.read_bytes()).hexdigest()[:32]
     cache_path = _caption_cache_path(work_dir, audio_hash)
@@ -1184,39 +1246,63 @@ def transcribe_caption_cues(src: Path, work_dir: Path) -> tuple[list[dict], str]
         except Exception:
             cache_path.unlink(missing_ok=True)
 
-    update_job_progress(40, "Transcribing captions")
+    update_job_progress(40, "Transcribing captions with Gemini")
+    file_name = None
     try:
-        with audio.open("rb") as fh, httpx.Client(timeout=120.0) as client:
-            files = {"file": (audio.name, fh, "audio/mpeg")}
-            data = {
-                "model": OPENAI_CAPTION_MODEL,
-                "response_format": "verbose_json",
-                "timestamp_granularities[]": "word",
-            }
+        file_uri, file_name = _upload_gemini_file(audio, "audio/mpeg")
+        payload = {
+            "model": GEMINI_TRANSCRIBE_MODEL,
+            "input": [{"type": "audio", "uri": file_uri, "mime_type": "audio/mpeg"}],
+            "generation_config": {
+                "transcription_config": {
+                    "language_codes": [],
+                    "mode": {"type": "verbatim", "timestamp_granularities": ["word"]},
+                }
+            },
+        }
+        with httpx.Client(timeout=180.0) as client:
             r = client.post(
-                f"{OPENAI_BASE_URL}/audio/transcriptions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                files=files,
-                data=data,
+                f"{GEMINI_BASE_URL}/interactions",
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json=payload,
             )
             if r.status_code >= 400:
-                raise RuntimeError(f"Transcription failed ({r.status_code}): {r.text[-1200:]}")
-            payload = r.json()
+                raise RuntimeError(f"Gemini transcription failed ({r.status_code}): {r.text[-1200:]}")
+            data = r.json()
+
+        transcript = ""
+        words: list[dict] = []
+        for step in data.get("steps", []) or []:
+            for content in step.get("content", []) or []:
+                if content.get("type") == "text" and content.get("text"):
+                    if not transcript:
+                        transcript = str(content.get("text", "")).strip()
+                for annotation in content.get("annotations", []) or []:
+                    if annotation.get("type") != "word_info":
+                        continue
+                    token = str(annotation.get("text", "")).strip()
+                    if not token:
+                        continue
+                    words.append({
+                        "word": token,
+                        "start": _offset_seconds(annotation.get("start_offset")),
+                        "end": _offset_seconds(annotation.get("end_offset")),
+                    })
+        # Some Interactions responses expose output text separately.
+        if not transcript:
+            transcript = str(data.get("output_text", "") or "").strip()
+        cues = words_to_caption_cues(words)
+        if not cues:
+            raise RuntimeError("Gemini transcription returned no timestamped speech")
     finally:
         audio.unlink(missing_ok=True)
+        _delete_gemini_file(file_name)
 
-    words = payload.get("words") or []
-    segments = payload.get("segments") or []
-    cues = words_to_caption_cues(words) if words else segments_to_caption_cues(segments)
-    if not cues:
-        raise RuntimeError("Transcription returned no timestamped speech")
-    transcript = str(payload.get("text", "")).strip()
     try:
-        cache_path.write_text(json.dumps({"cues": cues, "transcript": transcript, "model": OPENAI_CAPTION_MODEL}, ensure_ascii=False), encoding="utf-8")
+        cache_path.write_text(json.dumps({"cues": cues, "transcript": transcript, "model": GEMINI_TRANSCRIBE_MODEL}, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
     return cues, transcript
-
 
 def write_ass_captions(path: Path, cues: list[dict], video_size: tuple[int, int], position: str = "bottom") -> None:
     w, h = video_size
@@ -1710,10 +1796,10 @@ def sitemap():
 @app.get("/api/status")
 def status():
     return {
-        "version": "1.0-alpha",
-        "ai_enabled": bool(OPENAI_API_KEY),
-        "ai_model": OPENAI_MODEL if OPENAI_API_KEY else None,
-        "caption_model": OPENAI_CAPTION_MODEL if OPENAI_API_KEY else None,
+        "version": "1.0-alpha-gemini",
+        "ai_enabled": bool(GEMINI_API_KEY),
+        "ai_model": GEMINI_MODEL if GEMINI_API_KEY else None,
+        "caption_model": GEMINI_TRANSCRIBE_MODEL if GEMINI_API_KEY else None,
         "locales": SUPPORTED_LOCALES,
         "features": ["trim", "cut", "aspect", "volume", "speed", "text_overlay", "captions", "image_overlay", "music", "zoom_segment", "fade", "insert_clip", "replace_segment", "undo", "multi_step", "chat_context", "revise_last_edit", "multilingual_ui", "multilingual_commands", "localized_seo", "project_layers", "named_layer_references", "restore_layer", "remove_layer", "full_stack_rerender", "project_persistence", "recent_projects", "timeline_view", "background_render_jobs", "render_progress", "caption_cache", "true_crossfade", "export_settings", "first_run_onboarding", "healthcheck"],
     }
@@ -1721,7 +1807,7 @@ def status():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "version": "1.0-alpha"}
+    return {"ok": True, "version": "1.0-alpha-gemini"}
 
 
 @app.post("/api/upload")
@@ -1852,8 +1938,8 @@ def edit_video_core(req: EditRequest):
     # 1) Explicit reference to any existing layer.
     update_job_progress(16, "Resolving project layers")
     layer_action = parse_layer_reference_command(req.command, meta, current_duration)
-    if layer_action is None and OPENAI_API_KEY:
-        layer_action = parse_layer_reference_with_openai(req.command, meta, current_duration)
+    if layer_action is None and GEMINI_API_KEY:
+        layer_action = parse_layer_reference_with_gemini(req.command, meta, current_duration)
     if layer_action:
         layer = _layer_by_id(meta, layer_action.get("layer_id"))
         if not layer:
@@ -1883,8 +1969,8 @@ def edit_video_core(req: EditRequest):
     # being mistaken for a follow-up that moves the previous text to the top.
     plan, parser = parse_command(req.command, current_duration)
     if plan["edits"]:
-        if any(e.get("type") == "captions" for e in plan["edits"]) and not OPENAI_API_KEY:
-            raise HTTPException(400, "Auto captions need OPENAI_API_KEY. Other editing commands still work without it.")
+        if any(e.get("type") == "captions" for e in plan["edits"]) and not GEMINI_API_KEY:
+            raise HTTPException(400, "Auto captions need GEMINI_API_KEY. Other editing commands still work without it.")
         for edit in plan["edits"]:
             probe_edit = copy.deepcopy(edit)
             resolve_asset_for_edit(project_dir, meta, probe_edit)
